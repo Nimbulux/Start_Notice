@@ -2,6 +2,7 @@
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <wchar.h>
 
 // 自身单实例互斥体名称
 #define APP_MUTEX_NAME L"Global\\Start_Notice_SingleInstance"
@@ -57,38 +58,32 @@ static BOOL ReadConfigFile(wchar_t* targetPath, size_t pathSize)
 {
     FILE* fp = NULL;
     if (_wfopen_s(&fp, CONFIG_FILE, L"rt, ccs=UTF-8") != 0 || fp == NULL)
-    {
-        // 文件打开失败，使用默认值
         return FALSE;
-    }
 
-    // 读取第一行（忽略空行和前后空白）
-    char line[512] = { 0 };
-    if (fgets(line, sizeof(line), fp) == NULL)
+    // 用 fgetws 读取一行宽字符串（会去除行尾换行符）
+    if (fgetws(targetPath, (int)pathSize, fp) == NULL)
     {
         fclose(fp);
         return FALSE;
     }
     fclose(fp);
 
-    // 去除行尾换行符
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-        line[--len] = '\0';
+    // 去除末尾换行符
+    size_t len = wcslen(targetPath);
+    while (len > 0 && (targetPath[len - 1] == L'\n' || targetPath[len - 1] == L'\r'))
+        targetPath[--len] = L'\0';
 
     // 跳过前导空白
-    char* trimmed = line;
-    while (*trimmed == ' ' || *trimmed == '\t')
+    wchar_t* trimmed = targetPath;
+    while (*trimmed == L' ' || *trimmed == L'\t')
         trimmed++;
-
-    if (*trimmed == '\0')
-        return FALSE;   // 空行
-
-    // 将 UTF‑8 窄字符串转换为宽字符串
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, trimmed, -1, NULL, 0);
-    if (wlen <= 0 || (size_t)wlen > pathSize)
+    if (*trimmed == L'\0')
         return FALSE;
-    MultiByteToWideChar(CP_UTF8, 0, trimmed, -1, targetPath, (int)pathSize);
+
+    // 如果 trimmed 不是原始开头，则移动内容
+    if (trimmed != targetPath)
+        wmemmove(targetPath, trimmed, wcslen(trimmed) + 1);
+
     return TRUE;
 }
 
