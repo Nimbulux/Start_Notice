@@ -1,135 +1,144 @@
-﻿#include <windows.h>
-#include <tlhelp32.h>
+﻿#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shlwapi.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <wchar.h>
 
-// 自身单实例互斥体名称
-#define APP_MUTEX_NAME L"Global\\Start_Notice_SingleInstance"
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-// 配置文件名称（与启动器同目录）
-#define CONFIG_FILE L"config.txt"
+#define CONFIG_FILE     "config.txt"
+#define MUTEX_NAME      "Global\\Launcher_SingleInstance_Mutex"
 
-// 检查指定进程名是否已在运行（通过进程名精确匹配）
-static BOOL IsProcessRunning(const wchar_t* exeName)
-{
-    BOOL running = FALSE;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE)
-        return FALSE;
-
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(pe32);
-    if (Process32FirstW(hSnap, &pe32))
-    {
-        do
-        {
-            if (_wcsicmp(pe32.szExeFile, exeName) == 0)
-            {
-                running = TRUE;
-                break;
-            }
-        } while (Process32NextW(hSnap, &pe32));
-    }
-    CloseHandle(hSnap);
-    return running;
+ /* 获取当前 .exe 所在目录 (绝对路径) */
+static void get_exe_dir(char* dir, size_t size) {
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    PathRemoveFileSpecA(exe_path);
+    strcpy_s(dir, size, exe_path);
 }
 
-// 启动目标程序（传入可写的命令行缓冲区，避免访问冲突）
-static BOOL LaunchTarget(const wchar_t* exePath)
-{
-    wchar_t cmdLine[512];
-    wcscpy_s(cmdLine, _countof(cmdLine), exePath);
-
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    BOOL ret = CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE,
-        0, NULL, NULL, &si, &pi);
-    if (ret)
-    {
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    }
-    return ret;
+/* 构建 config.txt 的完整路径 */
+static void get_config_path(char* out, size_t size, const char* exe_dir) {
+    PathCombineA(out, exe_dir, CONFIG_FILE);
 }
 
-// 从配置文件读取目标程序路径（UTF‑8 编码的 config.txt）
-static BOOL ReadConfigFile(wchar_t* targetPath, size_t pathSize)
-{
-    FILE* fp = NULL;
-    if (_wfopen_s(&fp, CONFIG_FILE, L"rt, ccs=UTF-8") != 0 || fp == NULL)
-        return FALSE;
+/* 将相对路径转换为绝对路径 */
+static void make_absolute(char* abs_path, size_t size,
+    const char* base_dir, const char* rel_path) {
+    if (strlen(rel_path) >= 2 && rel_path[1] == ':') {
+        strncpy_s(abs_path, size, rel_path, _TRUNCATE);
+    }
+    else if (rel_path[0] == '\\' && rel_path[1] == '\\') {
+        strncpy_s(abs_path, size, rel_path, _TRUNCATE);
+    }
+    else {
+        PathCombineA(abs_path, base_dir, rel_path);
+    }
+}
 
-    // 用 fgetws 读取一行宽字符串（会去除行尾换行符）
-    if (fgetws(targetPath, (int)pathSize, fp) == NULL)
-    {
+/* 将错误码转换为可读字符串，返回需 LocalFree 释放 */
+static LPSTR format_error_message(DWORD err) {
+    LPSTR msgBuf = NULL;
+    FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER |
+        FORMAT_MESSAGE_FROM_SYSTEM |
+        FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, err,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPSTR)&msgBuf, 0, NULL);
+    return msgBuf;
+}
+
+/* 弹出错误消息框并退出 */
+static void fatal_error(const char* title, const char* format, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, format);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, format, args);
+    va_end(args);
+    MessageBoxA(NULL, buf, title, MB_OK | MB_ICONERROR);
+    ExitProcess(1);
+}
+
+int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPSTR lpCmdLine, _In_ int nCmdShow) {
+    /* 1. 获取自身所在目录 */
+    char exe_dir[MAX_PATH];
+    get_exe_dir(exe_dir, sizeof(exe_dir));
+
+    /* 2. 读取 config.txt */
+    char config_path[MAX_PATH];
+    get_config_path(config_path, sizeof(config_path), exe_dir);
+
+    FILE* fp = fopen(config_path, "r");
+    if (!fp) {
+        fatal_error("启动失败", "未找到 %s，请在同目录下创建该文件并写入要启动的程序名称。", CONFIG_FILE);
+    }
+
+    char target_line[MAX_PATH];
+    if (!fgets(target_line, sizeof(target_line), fp)) {
         fclose(fp);
-        return FALSE;
+        fatal_error("启动失败", "%s 内容为空。", CONFIG_FILE);
     }
     fclose(fp);
 
-    // 去除末尾换行符
-    size_t len = wcslen(targetPath);
-    while (len > 0 && (targetPath[len - 1] == L'\n' || targetPath[len - 1] == L'\r'))
-        targetPath[--len] = L'\0';
-
-    // 跳过前导空白
-    wchar_t* trimmed = targetPath;
-    while (*trimmed == L' ' || *trimmed == L'\t')
-        trimmed++;
-    if (*trimmed == L'\0')
-        return FALSE;
-
-    // 如果 trimmed 不是原始开头，则移动内容
-    if (trimmed != targetPath)
-        wmemmove(targetPath, trimmed, wcslen(trimmed) + 1);
-
-    return TRUE;
-}
-
-int WinMain(void)
-{
-    // 1. 自身单实例检查
-    HANDLE hMutex = CreateMutexW(NULL, FALSE, APP_MUTEX_NAME);
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        if (hMutex) CloseHandle(hMutex);
-        return 0;   // 已有实例，静默退出
+    // 去除换行符
+    target_line[strcspn(target_line, "\r\n")] = '\0';
+    if (strlen(target_line) == 0) {
+        fatal_error("启动失败", "%s 中未指定有效的程序名称。", CONFIG_FILE);
     }
 
-    // 2. 从配置文件读取目标程序名，失败则提示
-    wchar_t targetPath[512] = { 0 };
-    if (!ReadConfigFile(targetPath, _countof(targetPath)))
-    {
-        MessageBoxW(NULL, L"配置文件读取失败，请检查是否有'config.txt'", L"提示", MB_OK);
-        CloseHandle(hMutex);
-        return 1;
+    char target_path[MAX_PATH];
+    make_absolute(target_path, sizeof(target_path), exe_dir, target_line);
+
+    /* 3. 互斥体防止重复运行 */
+    HANDLE hMutex = CreateMutexA(NULL, TRUE, MUTEX_NAME);
+    if (hMutex == NULL) {
+        DWORD err = GetLastError();
+        LPSTR msg = format_error_message(err);
+        fatal_error("互斥体错误", "创建互斥体失败: %s", msg ? msg : "未知错误");
+        if (msg) LocalFree(msg);
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        fatal_error("程序已在运行", "启动器已在运行中，不允许重复启动。");
+    }
+    // 持有互斥体直到进程退出
+
+    /* 4. 启动目标程序 */
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    char cmd_line[MAX_PATH];
+    strcpy_s(cmd_line, sizeof(cmd_line), target_path);
+
+    if (!CreateProcessA(
+        NULL,
+        cmd_line,
+        NULL,
+        NULL,
+        FALSE,
+        0,
+        NULL,
+        NULL,
+        &si,
+        &pi)) {
+        DWORD err = GetLastError();
+        LPSTR msg = format_error_message(err);
+        fatal_error("启动失败", "无法启动目标程序:\n%s\n\n%s", target_path, msg ? msg : "未知错误");
+        if (msg) LocalFree(msg);
     }
 
-    // 3. 提取纯文件名（用于进程名检查）
-    wchar_t* exeName = wcsrchr(targetPath, L'\\');
-    if (exeName != NULL)
-        exeName++;      // 跳过反斜杠
-    else
-        exeName = targetPath;   // 没有路径，直接就是文件名
+    CloseHandle(pi.hThread);
 
-    // 4. 检查目标程序是否已在运行
-    if (IsProcessRunning(exeName))
-    {
-        // 已在运行，不再启动
-        CloseHandle(hMutex);
-        return 0;
-    }
+    /* 5. 等待目标程序结束（期间不显示任何窗口） */
+    WaitForSingleObject(pi.hProcess, INFINITE);
 
-    // 5. 启动目标程序
-    if (!LaunchTarget(targetPath))
-    {
-        MessageBoxW(NULL, L"启动目标程序失败！", L"错误", MB_ICONERROR);
-        CloseHandle(hMutex);
-        return 1;
-    }
-
-    // 6. 启动成功，退出启动器
+    CloseHandle(pi.hProcess);
     CloseHandle(hMutex);
+
     return 0;
 }
